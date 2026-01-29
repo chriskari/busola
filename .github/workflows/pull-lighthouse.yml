@@ -44,6 +44,8 @@ jobs:
           .github/scripts/setup_local_busola.sh | tee busola.log
       - name: Run lighthouse tests
         shell: bash
+        env:
+          NODE_OPTIONS: '--dns-result-order=ipv4first'
         timeout-minutes: 15
         run: |
           k3d kubeconfig get k3dCluster > tests/lighthouse/fixtures/kubeconfig.yaml
