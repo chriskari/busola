@@ -12,8 +12,11 @@ test('Busola Lighthouse audit', async () => {
     args: [
       '--remote-debugging-port=9222',
       '--remote-debugging-address=127.0.0.1',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
     ],
     ignoreHTTPSErrors: true,
+    headless: true,
   });
   const page = await context.newPage();
 
