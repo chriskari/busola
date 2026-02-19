@@ -332,12 +332,16 @@ function Resource({
     </>
   );
 
-  // https://stackoverflow.com/questions/70330862/how-to-get-the-latest-change-time-of-a-resource-instance-in-k8s
   let lastUpdate;
   const managedFields = resource.metadata?.managedFields;
   if (managedFields && Array.isArray(managedFields)) {
-    const lastOp = managedFields[managedFields.length - 1];
-    lastUpdate = lastOp.time;
+    const latestEntry = managedFields.reduce((latest, current) => {
+      if (!current.time) return latest;
+      if (!latest || !latest.time) return current;
+      return new Date(current.time) > new Date(latest.time) ? current : latest;
+    }, null);
+
+    lastUpdate = latestEntry?.time;
   }
 
   const renderUpdateDate = (lastUpdate) => {
@@ -417,6 +421,7 @@ function Resource({
           >
             <ReadableElapsedTimeFromNow
               timestamp={resource.metadata.creationTimestamp}
+              format="age"
             />
           </DynamicPageComponent.Column>
           {!hideLastUpdate && (
