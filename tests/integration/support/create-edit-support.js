@@ -9,8 +9,10 @@ Cypress.Commands.add('openCreate', () => {
     .should('exist');
 });
 
-Cypress.Commands.add('saveChanges', (action = 'Create') => {
+Cypress.Commands.add('saveChanges', (action = 'Create', options = {}) => {
+  const { waitForToast = true } = options;
   const isCreate = action === 'Create';
+  cy.wait(250);
   cy.get(isCreate ? '[data-testid="create-form-footer-bar"]' : '.edit-form')
     .contains('ui5-button:visible', isCreate ? 'Create' : 'Save')
     .click();
@@ -20,8 +22,9 @@ Cypress.Commands.add('saveChanges', (action = 'Create') => {
     cy.get('[data-testid="create-form-footer-bar"]', { timeout: 30000 }).should(
       'not.exist',
     );
+  } else if (waitForToast) {
+    cy.contains('ui5-toast', /updated/, { timeout: 30000 }).should('exist');
   }
-  // an edit keeps the form mounted and a no-op sends no request, so there is no signal to wait on
 });
 
 Cypress.Commands.add('checkUnsavedDialog', () => {

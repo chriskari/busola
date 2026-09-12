@@ -83,9 +83,8 @@ Cypress.Commands.add('goToNamespaceDetails', (namespace) => {
   // runs against the cluster-scope sidebar where sub-items like Roles don't exist yet
   cy.location('pathname').should('match', new RegExp(`/namespaces/${name}$`));
 
-  // the URL flips before the namespace view mounts, so also wait for that scope to be up:
-  // both the "Namespace Overview" sidebar item and the page title only exist here. Without
-  // this a following navigateTo races the sidebar transition and finds its sub-item at 0x0.
+  // URL flips before the namespace view mounts; wait for the sidebar scope to switch too,
+  // else a following navigateTo races the transition and misses its sub-item
   cy.getLeftNav()
     .get('ui5-side-navigation-item[text="Namespace Overview"]')
     .should('be.visible');
@@ -365,8 +364,7 @@ Cypress.Commands.add('closeEndColumn', (checkIfNotExist = false) => {
 });
 
 Cypress.Commands.add('typeInSearch', (searchPhrase, force = false) => {
-  // UI5 re-templates the inner <input> during list re-renders (create refetch, extension-load
-  // storm), so re-query between clear and type to avoid "page updated while command was executing"
+  // UI5 re-templates the inner <input> on list re-renders; re-query between clear and type
   const searchInput = () =>
     cy.get('ui5-input[id^=search-]:visible').find('input');
 

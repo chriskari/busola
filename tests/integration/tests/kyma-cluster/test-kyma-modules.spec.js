@@ -247,7 +247,7 @@ context('Test Kyma Modules views', () => {
 
     cy.checkUnsavedDialog();
 
-    cy.saveChanges('Edit');
+    cy.saveChanges('Edit', { waitForToast: false });
 
     cy.contains('Change Release Channel').should('be.visible');
 
@@ -283,7 +283,7 @@ context('Test Kyma Modules views', () => {
       .find('li')
       .click({ force: true });
 
-    cy.saveChanges('Edit');
+    cy.saveChanges('Edit', { waitForToast: false });
 
     cy.contains('Change Release Channel').should('be.visible');
 

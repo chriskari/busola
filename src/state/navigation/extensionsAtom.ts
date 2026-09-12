@@ -405,9 +405,8 @@ const pushExtToEventTypes = (extensions: any) => {
   });
 };
 
-// openapiAtom fetches once at login, so a freshly installed extension's resource may be absent
-// from OpenAPI all session and its nav category never appears. CRDs have no such lag, so treat
-// an installed CRD as proof that its resource exists and merge it into the existence check.
+// openapiAtom fetches once at login, so a freshly-installed extension's nav category can stay
+// hidden all session. CRDs have no such lag, so treat an installed CRD as proof its resource exists.
 const getCrdResourcePathIds = (crds: unknown): string[] => {
   const items =
     (crds as { items?: CustomResourceDefinition[] } | null)?.items ?? [];

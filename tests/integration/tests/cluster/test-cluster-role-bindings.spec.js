@@ -24,9 +24,7 @@ context('Test Cluster Role Bindings', () => {
       .click()
       .type(CRB_NAME);
 
-    // fill the subject before picking the role: selecting a ClusterRole closes the combobox
-    // popover, which re-templates the subject inputs and briefly disables the user name field.
-    // Setting the name first means we never type into it during that re-render.
+    // fill subject before picking role: closing the ClusterRole combobox re-templates inputs and briefly disables user name
     cy.get('[accessible-name="User name"]')
       .find('input')
       .should('not.be.disabled')

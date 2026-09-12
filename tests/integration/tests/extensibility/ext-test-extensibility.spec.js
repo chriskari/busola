@@ -88,8 +88,7 @@ context('Test Extensibility Create/Update', () => {
   });
 
   it('Check if Extensions is created', () => {
-    // creating an extension reloads the nav subsystem and keeps re-rendering the list;
-    // no assertable signal, so let it settle before searching
+    // extension creation reloads the nav subsystem; no assertable signal, so let it settle
     cy.wait(2000);
     cy.typeInSearch(EXTENSION_NAME);
     cy.get('ui5-suggestion-item').contains('li', EXTENSION_NAME).click();
