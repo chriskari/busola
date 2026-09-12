@@ -103,12 +103,9 @@ context('Test app settings and preferences', () => {
       .should('be.visible')
       .click();
 
-    cy.getLeftNav().contains('Back To Cluster Overview').click();
+    cy.goToClusterOverview();
 
-    cy.getLeftNav()
-      .find('ui5-side-navigation-item')
-      .contains('Namespaces')
-      .click();
+    cy.navigateTo('Namespaces');
 
     cy.get('ui5-table-row')
       .contains(/^kube-system/)

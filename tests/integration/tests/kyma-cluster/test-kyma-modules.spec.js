@@ -103,7 +103,7 @@ context('Test Kyma Modules views', () => {
   });
 
   it('Test number of Modules in Modules Overview card', () => {
-    cy.getLeftNav().contains('Cluster Overview').click();
+    cy.goToClusterOverview();
 
     // Uncomment after adding local KLM
     // cy.contains('ui5-card', 'Installed Modules')

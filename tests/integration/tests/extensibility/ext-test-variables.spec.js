@@ -17,7 +17,7 @@ context('Test extensibility variables', () => {
   });
 
   it('Creates the EXT test resources config', () => {
-    cy.getLeftNav().contains('Cluster Overview').click();
+    cy.goToClusterOverview();
 
     cy.contains('ui5-button', 'Upload YAML').click();
 

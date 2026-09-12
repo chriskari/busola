@@ -198,7 +198,7 @@ context('Test reduced permissions', () => {
 
     cy.getLeftNav().contains('Deployments').should('be.visible');
 
-    cy.getLeftNav().contains('Back To Cluster Overview').click();
+    cy.goToClusterOverview();
 
     cy.getLeftNav().contains('Configuration').should('not.exist');
   });
