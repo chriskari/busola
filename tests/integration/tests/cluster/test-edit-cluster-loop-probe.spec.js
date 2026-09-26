@@ -30,10 +30,12 @@ const IDLE_SAMPLES = Number(Cypress.env('LOOP_PROBE_IDLE_SAMPLES')) || 60; // ~2
 const HOLD_INTERVAL_MS = 2000;
 const HEAP_ABORT_MB = 3400; // near Chrome's ~3.8GB per-renderer cap
 const CHECKPOINT_EVERY = 5; // dump a CPU/heap profile chunk every N amplifier iterations
-// Amplifier iterations at which to pull a full heap snapshot. 1 and 2 are insurance
-// (the renderer has crashed as early as ~iteration 3); 5 and 10 are richer captures if
-// it survives longer. A snapshot even at amp-1 already shows the detached-DOM retainer.
-const AMP_SNAPSHOT_AT = [1, 2, 5, 10];
+// Amplifier iterations at which to pull a full heap snapshot. amp-1 is a near-baseline
+// reference; the rest sample the ratchet as it climbs. Taking a snapshot forces a full GC
+// first, so whatever detached DOM the snapshot reports is genuinely RETAINED (not transient
+// garbage). The renderer can crash mid-amplifier (seen as early as ~iteration 3), so the
+// early captures are insurance and the later ones are richer if it survives.
+const AMP_SNAPSHOT_AT = [1, 4, 8, 12, 16, 20];
 
 // Thin wrapper around Cypress's CDP channel. Resolves with the CDP result object.
 const cdp = (command, params = {}) =>
@@ -237,19 +239,19 @@ const editCycle = (i) => {
     cy.then(() => idleStep(IDLE_SAMPLES));
   });
 
-  it('amplifies the edit-cluster rename flow', () => {
-    for (let i = 0; i < AMPLIFIER_ITERATIONS; i++) {
+  // Each amplifier iteration is its OWN test so Cypress releases the command queue between
+  // iterations (numTestsKeptInMemory:0). This strips the harness confound from the captured
+  // heap snapshots: a single giant it() would accumulate hundreds of cy command `subject`s,
+  // and those jQuery subjects pin every navigated-away page's detached DOM — a snapshot then
+  // shows Cypress's CommandQueue as the (nearest-root) retainer, masking the genuine one.
+  // With per-iteration tests, only the current cycle's few subjects exist at snapshot time,
+  // so the real retainer (the app/UI5 structure that survives across tests via the persistent
+  // AUT window) is the shortest path in the graph, not Cypress.
+  for (let i = 0; i < AMPLIFIER_ITERATIONS; i++) {
+    it(`amplifies the edit-cluster rename flow #${i}`, () => {
       editCycle(i);
       sampleMetrics(`amp-${i}`);
       snapshotInPage(`amp-${i}`);
-      // Capture full heap snapshots EARLY, from inside the amplifier itself. The renderer
-      // crashes mid-amplifier — observed as early as ~iteration 3 (the detached-DOM ratchet
-      // OOMs native memory; Performance.getMetrics `Nodes` only counts ATTACHED nodes so it
-      // looks deceptively low right up to the crash). A snapshot deferred to a later test
-      // (the hold phase) is therefore unreliable — that test may never run. Cypress enqueues
-      // every command up front and runs them serially, so a capture enqueued at a low
-      // iteration executes before the crash-inducing later cycles: the early ones always
-      // land, the later ones are richer if the renderer survives that far.
       if (AMP_SNAPSHOT_AT.includes(i)) {
         heapSnapshot(`amp-${i}`);
       }
@@ -257,8 +259,8 @@ const editCycle = (i) => {
         dumpCpuCheckpoint();
         dumpHeapCheckpoint(false);
       }
-    }
-  });
+    });
+  }
 
   it('holds and observes while the loop ratchets', () => {
     // Bonus retainer snapshots if the amplifier survived all iterations without crashing.
