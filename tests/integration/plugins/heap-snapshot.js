@@ -85,8 +85,25 @@ async function captureHeapSnapshot({
   return await new Promise((resolve) => {
     let ws;
     let done = false;
-    const chunks = [];
+    let rawBytes = 0;
     const TAKE_ID = 2;
+
+    // Stream chunks straight through gzip into the output file. A large snapshot
+    // (>~400MB) exceeds Node's max string length, so we must NOT buffer the chunks and
+    // join them into one string — pipe each chunk into a zlib.Gzip stream instead, which
+    // bounds memory and handles any size. The file/gzip streams are created lazily on the
+    // first chunk so a snapshot that errors before any data leaves no empty file.
+    let gzip = null;
+    let fileStream = null;
+    const outPath = path.join(outDir, `${name}.gz`);
+
+    const ensureStreams = () => {
+      if (gzip) return;
+      fs.mkdirSync(outDir, { recursive: true });
+      fileStream = fs.createWriteStream(outPath);
+      gzip = zlib.createGzip();
+      gzip.pipe(fileStream);
+    };
 
     const finish = (result) => {
       if (done) return;
@@ -101,7 +118,7 @@ async function captureHeapSnapshot({
     };
 
     const timer = setTimeout(
-      () => finish({ ok: false, reason: 'timeout', chunks: chunks.length }),
+      () => finish({ ok: false, reason: 'timeout', rawBytes }),
       timeoutMs,
     );
 
@@ -130,26 +147,40 @@ async function captureHeapSnapshot({
         return;
       }
       if (msg.method === 'HeapProfiler.addHeapSnapshotChunk') {
-        chunks.push(msg.params.chunk);
+        try {
+          ensureStreams();
+          rawBytes += Buffer.byteLength(msg.params.chunk, 'utf8');
+          gzip.write(msg.params.chunk);
+        } catch (e) {
+          return finish({ ok: false, reason: `write: ${e}`, rawBytes });
+        }
       } else if (msg.id === TAKE_ID) {
         // CDP delivers every addHeapSnapshotChunk event before this response.
         if (msg.error) {
           return finish({ ok: false, reason: `CDP: ${msg.error.message}` });
         }
-        try {
-          fs.mkdirSync(outDir, { recursive: true });
-          const buf = Buffer.from(chunks.join(''), 'utf8');
-          const gz = zlib.gzipSync(buf);
-          fs.writeFileSync(path.join(outDir, `${name}.gz`), gz);
-          finish({ ok: true, bytes: buf.length, gzBytes: gz.length });
-        } catch (e) {
-          finish({ ok: false, reason: `write: ${e}` });
+        if (!gzip) {
+          return finish({ ok: false, reason: 'no chunks received' });
         }
+        // flush the gzip stream and wait for the file to be fully written before resolving
+        fileStream.on('finish', () => {
+          let gzBytes = 0;
+          try {
+            gzBytes = fs.statSync(outPath).size;
+          } catch {
+            /* ignore */
+          }
+          finish({ ok: true, bytes: rawBytes, gzBytes });
+        });
+        fileStream.on('error', (e) =>
+          finish({ ok: false, reason: `write: ${e}`, rawBytes }),
+        );
+        gzip.end();
       }
     });
 
     ws.addEventListener('error', () =>
-      finish({ ok: false, reason: 'ws error', chunks: chunks.length }),
+      finish({ ok: false, reason: 'ws error', rawBytes }),
     );
   });
 }
