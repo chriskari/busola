@@ -150,24 +150,24 @@ for (let src = 0; src < nodeCount; src++) {
     const dst = edgeTo(ei);
     if (!isDetached[dst]) continue;
     const key = `${nodeType(src)} «${nodeName(src)}» --${edgeLabel(ei)}-->`;
-    const e = retAgg.get(key) || { count: 0, self: 0, exSrcId: nodeId(src) };
+    const e = retAgg.get(key) || { count: 0, self: 0, exSrc: src, exDst: dst };
     e.count++;
     e.self += nodeSelf(dst);
     retAgg.set(key, e);
   }
 }
+const topRetainers = [...retAgg.entries()]
+  .sort((a, b) => b[1].self - a[1].self)
+  .slice(0, TOP);
 console.log(
   `\n=== dominant retaining edges (live object -> detached), top ${TOP} ===`,
 );
 console.log('(count = # detached targets, self = their summed self_size)');
-[...retAgg.entries()]
-  .sort((a, b) => b[1].self - a[1].self)
-  .slice(0, TOP)
-  .forEach(([k, v]) =>
-    console.log(
-      `  ${String(v.count).padStart(6)}  ${(v.self / 1024).toFixed(0).padStart(8)} KB  ${k}`,
-    ),
-  );
+topRetainers.forEach(([k, v]) =>
+  console.log(
+    `  ${String(v.count).padStart(6)}  ${(v.self / 1024).toFixed(0).padStart(8)} KB  ${k}`,
+  ),
+);
 
 // --- shortest retainer paths from a GC root to a few large detached nodes ---
 // BFS over reverse edges (retainers). Build reverse adjacency once.
@@ -238,19 +238,12 @@ const bfsToRoot = (target) => {
   return null;
 };
 
-console.log(
-  '\n=== shortest root->detached retainer paths (largest 5 detached) ===',
-);
-for (const t of pathTargets) {
-  const chain = bfsToRoot(t);
-  console.log(
-    `\n• target: ${nodeType(t)} «${nodeName(t)}» id=${nodeId(t)} self=${nodeSelf(t)}B`,
-  );
+const printChain = (chain) => {
   if (!chain) {
     console.log(
       '  (no path to a root found — likely retained only within detached set)',
     );
-    continue;
+    return;
   }
   chain.forEach((step, i) => {
     const via = step.edge === -1 ? '' : `  --${edgeLabel(step.edge)}-->`;
@@ -259,4 +252,83 @@ for (const t of pathTargets) {
       `  ${'  '.repeat(i)}${nodeType(step.node)} «${nodeName(step.node)}»${flag}${via}`,
     );
   });
+};
+
+console.log(
+  '\n=== shortest root->detached retainer paths (largest 5 detached) ===',
+);
+for (const t of pathTargets) {
+  console.log(
+    `\n• target: ${nodeType(t)} «${nodeName(t)}» id=${nodeId(t)} self=${nodeSelf(t)}B`,
+  );
+  printChain(bfsToRoot(t));
 }
+
+// --- trace the DOMINANT retaining edges up to a root ---------------------------
+// The largest-self detached nodes are often browser-internal (cached detached documents),
+// which is noise. The dominant retaining EDGES (aggregated above) are the real signal:
+// trace the live SOURCE object of each up to a GC root to see what app structure holds it.
+console.log(
+  `\n=== root paths for the top ${Math.min(TOP, 10)} dominant retaining edges ===`,
+);
+for (const [k, v] of topRetainers.slice(0, 10)) {
+  console.log(`\n• ${v.count}× ${k}`);
+  console.log(
+    `  retaining object: ${nodeType(v.exSrc)} «${nodeName(v.exSrc)}» id=${nodeId(v.exSrc)}`,
+  );
+  printChain(bfsToRoot(v.exSrc));
+}
+
+// --- Cypress-artifact test: how much detached DOM survives WITHOUT the harness? -----------
+// The amplifier runs ~hundreds of commands in ONE it(); Cypress retains every command's
+// jQuery `subject` (chained via prevObject) in cy.queue.CommandQueue until the test ends.
+// That is a TEST-HARNESS retainer, absent in production. Forward-reachability from all GC
+// roots while REFUSING to traverse the Cypress command-queue machinery tells us how many
+// detached nodes an app-level (or browser-internal) retainer holds independently of Cypress.
+const CYPRESS_NAMES = new Set([
+  '$Cy',
+  'CommandQueue',
+  '$Command',
+  '$Chainer',
+  'jQuery.fn.init',
+]);
+const isCypress = (ni) => CYPRESS_NAMES.has(nodeName(ni));
+
+const reachable = new Uint8Array(nodeCount);
+const rq = [];
+for (let ni = 0; ni < nodeCount; ni++) {
+  if (nodeType(ni) === 'synthetic' && !isCypress(ni)) {
+    reachable[ni] = 1;
+    rq.push(ni);
+  }
+}
+let rhead = 0;
+while (rhead < rq.length) {
+  const cur = rq[rhead++];
+  const end = firstEdge[cur + 1];
+  for (let ei = firstEdge[cur]; ei < end; ei++) {
+    if (edgeTypeName(ei) === 'weak') continue;
+    const dst = edgeTo(ei);
+    if (reachable[dst] || isCypress(dst)) continue; // don't route through the harness
+    reachable[dst] = 1;
+    rq.push(dst);
+  }
+}
+let survives = 0;
+let survivesSelf = 0;
+for (let ni = 0; ni < nodeCount; ni++) {
+  if (isDetached[ni] && reachable[ni]) {
+    survives++;
+    survivesSelf += nodeSelf(ni);
+  }
+}
+console.log('\n=== Cypress-artifact test ===');
+console.log(
+  'detached nodes still reachable from a root WITHOUT traversing Cypress cy.queue:',
+);
+console.log(
+  `  ${survives} / ${detachedCount}  (${((100 * survives) / detachedCount).toFixed(1)}%)  self ${(survivesSelf / 1048576).toFixed(2)} MB`,
+);
+console.log(
+  `  → ${detachedCount - survives} detached nodes are retained ONLY via the Cypress command queue (harness artifact).`,
+);
