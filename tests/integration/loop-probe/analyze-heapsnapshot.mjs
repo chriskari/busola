@@ -279,12 +279,17 @@ for (const [k, v] of topRetainers.slice(0, 10)) {
   printChain(bfsToRoot(v.exSrc));
 }
 
-// --- Cypress-artifact test: how much detached DOM survives WITHOUT the harness? -----------
-// The amplifier runs ~hundreds of commands in ONE it(); Cypress retains every command's
-// jQuery `subject` (chained via prevObject) in cy.queue.CommandQueue until the test ends.
-// That is a TEST-HARNESS retainer, absent in production. Forward-reachability from all GC
-// roots while REFUSING to traverse the Cypress command-queue machinery tells us how many
-// detached nodes an app-level (or browser-internal) retainer holds independently of Cypress.
+// --- cut-based dominance test: who is RESPONSIBLE for retaining the detached DOM? --------
+// Shortest-path BFS names the *nearest* root but can hide a longer alternate retainer, and
+// plain reachability can't attribute retention (the detached island is internally cross-
+// linked). The authoritative question — the one Chrome's "retained size" answers — is: if we
+// CUT retainer X's edges, how many detached nodes become unreachable from a real GC root?
+// Those nodes were retained (dominated) by X. We test three cut-sets:
+//   • Cypress   — the command queue pins each command's jQuery `subject` (harness artifact)
+//   • Browser   — detached documents cached via Window#DocumentCachedAccessor (Chromium internal)
+//   • Both      — cut simultaneously; whatever still survives has a genuine app/other retainer
+// Implementation: forward BFS from real GC roots, treating cut nodes as leaves (their outgoing
+// edges are not followed) and skipping cut edge labels. Compare detached-reachable counts.
 const CYPRESS_NAMES = new Set([
   '$Cy',
   'CommandQueue',
@@ -292,43 +297,149 @@ const CYPRESS_NAMES = new Set([
   '$Chainer',
   'jQuery.fn.init',
 ]);
-const isCypress = (ni) => CYPRESS_NAMES.has(nodeName(ni));
+const isCypressNode = (ni) => CYPRESS_NAMES.has(nodeName(ni));
+const isBrowserCacheEdge = (ei) =>
+  edgeLabel(ei).includes('DocumentCachedAccessor');
 
-const reachable = new Uint8Array(nodeCount);
-const rq = [];
+// real GC roots = synthetic nodes (super-root children). Cypress $Cy et al. are ordinary
+// objects reachable from Window, so cutting them at expansion removes only their retention.
+const realRoots = [];
 for (let ni = 0; ni < nodeCount; ni++) {
-  if (nodeType(ni) === 'synthetic' && !isCypress(ni)) {
-    reachable[ni] = 1;
-    rq.push(ni);
-  }
+  if (nodeType(ni) === 'synthetic') realRoots.push(ni);
 }
-let rhead = 0;
-while (rhead < rq.length) {
-  const cur = rq[rhead++];
-  const end = firstEdge[cur + 1];
-  for (let ei = firstEdge[cur]; ei < end; ei++) {
-    if (edgeTypeName(ei) === 'weak') continue;
+
+// reachFrom: forward BFS from real roots. cutNode(ni)=>treat as leaf; cutEdge(ei)=>skip edge.
+const reachFrom = (cutNode, cutEdge) => {
+  const seen = new Uint8Array(nodeCount);
+  const q = [];
+  for (const r of realRoots) {
+    if (!seen[r]) {
+      seen[r] = 1;
+      q.push(r);
+    }
+  }
+  let head = 0;
+  while (head < q.length) {
+    const cur = q[head++];
+    if (cutNode && cutNode(cur)) continue; // cut: don't follow this node's edges
+    const end = firstEdge[cur + 1];
+    for (let ei = firstEdge[cur]; ei < end; ei++) {
+      if (edgeTypeName(ei) === 'weak') continue;
+      if (cutEdge && cutEdge(ei)) continue;
+      const dst = edgeTo(ei);
+      if (!seen[dst]) {
+        seen[dst] = 1;
+        q.push(dst);
+      }
+    }
+  }
+  return seen;
+};
+
+const detachedReachable = (seen) => {
+  let n = 0;
+  let self = 0;
+  for (let ni = 0; ni < nodeCount; ni++) {
+    if (isDetached[ni] && seen[ni]) {
+      n++;
+      self += nodeSelf(ni);
+    }
+  }
+  return { n, self };
+};
+
+const base = detachedReachable(reachFrom(null, null));
+const cutCy = detachedReachable(reachFrom(isCypressNode, null));
+const cutBr = detachedReachable(reachFrom(null, isBrowserCacheEdge));
+const cutBoth = detachedReachable(reachFrom(isCypressNode, isBrowserCacheEdge));
+const pct = (x) => ((100 * x) / (base.n || 1)).toFixed(1);
+const mb = (b) => (b / 1048576).toFixed(2);
+
+console.log(
+  '\n=== cut-based dominance test (detached nodes freed by cutting a retainer) ===',
+);
+console.log(
+  `baseline detached reachable from real roots: ${base.n} (${mb(base.self)} MB)`,
+);
+console.log(
+  `  cut Cypress cy.queue      → ${cutCy.n} remain; FREED ${base.n - cutCy.n} (${pct(base.n - cutCy.n)}%)`,
+);
+console.log(
+  `  cut Browser DocCache      → ${cutBr.n} remain; FREED ${base.n - cutBr.n} (${pct(base.n - cutBr.n)}%)`,
+);
+console.log(
+  `  cut BOTH                  → ${cutBoth.n} remain; FREED ${base.n - cutBoth.n} (${pct(base.n - cutBoth.n)}%)`,
+);
+console.log(
+  `  → ${cutBoth.n} detached nodes (${mb(cutBoth.self)} MB) survive BOTH cuts = retained by a genuine app/other dominator.`,
+);
+
+// --- find the GENUINE retainer: live entry edges into the detached island that survive -----
+// both cuts. Aggregate by source object, then trace to a root while AVOIDING Cypress nodes and
+// browser-cache edges, so the path shown is the real (app/UI5) retainer, not the nearest one.
+const seenBoth = reachFrom(isCypressNode, isBrowserCacheEdge);
+const genAgg = new Map();
+for (let src = 0; src < nodeCount; src++) {
+  if (!seenBoth[src] || isDetached[src] || isCypressNode(src)) continue;
+  const end = firstEdge[src + 1];
+  for (let ei = firstEdge[src]; ei < end; ei++) {
+    if (edgeTypeName(ei) === 'weak' || isBrowserCacheEdge(ei)) continue;
     const dst = edgeTo(ei);
-    if (reachable[dst] || isCypress(dst)) continue; // don't route through the harness
-    reachable[dst] = 1;
-    rq.push(dst);
+    if (!isDetached[dst]) continue;
+    const key = `${nodeType(src)} «${nodeName(src)}» --${edgeLabel(ei)}-->`;
+    const e = genAgg.get(key) || { count: 0, self: 0, exSrc: src };
+    e.count++;
+    e.self += nodeSelf(dst);
+    genAgg.set(key, e);
   }
 }
-let survives = 0;
-let survivesSelf = 0;
-for (let ni = 0; ni < nodeCount; ni++) {
-  if (isDetached[ni] && reachable[ni]) {
-    survives++;
-    survivesSelf += nodeSelf(ni);
+const genTop = [...genAgg.entries()]
+  .sort((a, b) => b[1].self - a[1].self)
+  .slice(0, 12);
+console.log(
+  '\n=== GENUINE entry edges (live, non-Cypress, non-browser) -> detached, top 12 ===',
+);
+genTop.forEach(([k, v]) =>
+  console.log(
+    `  ${String(v.count).padStart(6)}  ${(v.self / 1024).toFixed(0).padStart(8)} KB  ${k}`,
+  ),
+);
+
+// constrained reverse BFS: nearest root NOT via Cypress nodes / browser-cache edges.
+const bfsToRootGenuine = (target) => {
+  const prevNode = new Int32Array(nodeCount).fill(-1);
+  const prevEdge = new Int32Array(nodeCount).fill(-1);
+  const seen = new Uint8Array(nodeCount);
+  const q = [target];
+  seen[target] = 1;
+  let head = 0;
+  while (head < q.length) {
+    const cur = q[head++];
+    if (cur !== target && isRoot(cur) && !isCypressNode(cur)) {
+      const chain = [];
+      let n = cur;
+      while (n !== -1 && n !== target) {
+        chain.push({ node: n, edge: prevEdge[n] });
+        n = prevNode[n];
+      }
+      chain.push({ node: target, edge: -1 });
+      return chain;
+    }
+    for (let r = revFirst[cur]; r < revFirst[cur + 1]; r++) {
+      const s = revSrc[r];
+      if (seen[s] || isCypressNode(s)) continue; // never route through the harness
+      if (isBrowserCacheEdge(revEdge[r])) continue; // nor via browser doc-cache
+      seen[s] = 1;
+      prevNode[s] = cur;
+      prevEdge[s] = revEdge[r];
+      q.push(s);
+    }
   }
+  return null;
+};
+
+console.log('\n=== genuine retainer paths for the top 6 entry edges ===');
+for (const [k, v] of genTop.slice(0, 6)) {
+  console.log(`\n• ${v.count}× ${k}`);
+  printChain(bfsToRootGenuine(v.exSrc));
 }
-console.log('\n=== Cypress-artifact test ===');
-console.log(
-  'detached nodes still reachable from a root WITHOUT traversing Cypress cy.queue:',
-);
-console.log(
-  `  ${survives} / ${detachedCount}  (${((100 * survives) / detachedCount).toFixed(1)}%)  self ${(survivesSelf / 1048576).toFixed(2)} MB`,
-);
-console.log(
-  `  → ${detachedCount - survives} detached nodes are retained ONLY via the Cypress command queue (harness artifact).`,
-);
