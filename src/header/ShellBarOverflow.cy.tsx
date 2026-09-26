@@ -52,7 +52,13 @@ describe('ShellBar overflow actions', () => {
       .find('#ui5-shellbar-overflow-button')
       .should('be.visible')
       .click();
-    cy.contains('ui5-li', 'Target action').click();
+    // UI5 2.27 renders overflow entries as <ui5-shellbar-item in-overflow> whose
+    // ListItemStandard (ui5-li) lives in the item's shadow DOM — the label is a
+    // property, so the old light-DOM `cy.contains('ui5-li', …)` no longer matches.
+    cy.get('ui5-shellbar-item[text="Target action"]')
+      .shadow()
+      .find('ui5-li')
+      .click();
 
     cy.get('@onAction').should('have.been.calledOnce');
   });
