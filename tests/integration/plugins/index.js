@@ -2,6 +2,7 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { captureHeapSnapshot } = require('./heap-snapshot');
+const { captureMemoryDump } = require('./memory-dump');
 
 // ---------------------------------------------------------------------------
 // edit-cluster OOM loop diagnostic probe (see support/loop-probe.js).
@@ -196,6 +197,37 @@ module.exports = async (on, config) => {
         appendLine(
           'heapsnapshot-log.jsonl',
           JSON.stringify({ ts: Date.now(), name: snapName, ...result }),
+        );
+      } catch {
+        /* ignore log write errors */
+      }
+      return result;
+    },
+    // Capture a native (Blink C++) memory-infra dump over an independent CDP WebSocket
+    // (see plugins/memory-dump.js) — the allocator-level breakdown (malloc, partition_alloc,
+    // blink_gc, v8) that the V8 heap snapshot cannot weigh. This is what proves the RSS
+    // ratchet lives in Blink native memory (attached layout tree), not the JS heap. Written
+    // gzipped JSONL to cypress/loop-probe/<name>.memtrace.jsonl.gz. Never throws; returns an
+    // {ok,...} result the spec logs. Call it with an extended per-command timeout, e.g.
+    // cy.task('probeMemoryDump', { name }, { timeout: 60000 }).
+    async probeMemoryDump({ name }) {
+      const dumpName = name || `mem-${Date.now()}`;
+      let result;
+      try {
+        result = await captureMemoryDump({
+          port: probeChromeDebugPort,
+          name: dumpName,
+          outDir: PROBE_DIR,
+          timeoutMs: 55000,
+        });
+      } catch (e) {
+        result = { ok: false, reason: String(e) };
+      }
+      try {
+        fs.mkdirSync(PROBE_DIR, { recursive: true });
+        appendLine(
+          'memdump-log.jsonl',
+          JSON.stringify({ ts: Date.now(), name: dumpName, ...result }),
         );
       } catch {
         /* ignore log write errors */

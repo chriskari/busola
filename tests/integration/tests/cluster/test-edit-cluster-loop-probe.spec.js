@@ -22,6 +22,17 @@ import config from '../../config';
 
 const PROBE_ON = !!Cypress.env('LOOP_PROBE');
 
+// A/B arm selector (temporary scaffolding): when CYPRESS_DISABLE_CHART_ANIMATION=1 is set,
+// force the overview's recharts radial charts to skip animation by planting a window flag
+// before the app boots on every navigation. UI5RadialChart reads it. Running one loop-probe
+// with the env and one without — on the SAME build — isolates the recharts animation loop as
+// the RSS-ratchet driver with no confound. Removed once confirmed (the fix uses a prop).
+if (Cypress.env('DISABLE_CHART_ANIMATION')) {
+  Cypress.on('window:before:load', (win) => {
+    win.__DISABLE_CHART_ANIMATION = true;
+  });
+}
+
 const DESC = 'loop-probe amplifier description';
 const TEMP_NAME = 'loop-probe-tmp';
 const AMPLIFIER_ITERATIONS = Number(Cypress.env('LOOP_PROBE_ITERATIONS')) || 25;
@@ -80,15 +91,28 @@ const sampleMetrics = (tag) =>
   cy.then(() =>
     cdpSafe('Performance.getMetrics').then((res) => {
       const metrics = res?.metrics;
-      cy.task('probeAppend', {
-        file: 'cdp-metrics.jsonl',
-        line: JSON.stringify({ ts: Date.now(), tag, metrics }),
+      // Memory.getDOMCounters returns its payload in the command response (like
+      // Performance.getMetrics), so it's a cheap, event-free live-DOM counter series
+      // (documents/nodes/jsEventListeners) parallel to the LayoutObjects metric — the
+      // two together confirm the growth is live attached DOM, not detached documents.
+      return cdpSafe('Memory.getDOMCounters').then((dom) => {
+        const domCounters = dom?.__cdpError
+          ? undefined
+          : {
+              documents: dom?.documents,
+              nodes: dom?.nodes,
+              jsEventListeners: dom?.jsEventListeners,
+            };
+        cy.task('probeAppend', {
+          file: 'cdp-metrics.jsonl',
+          line: JSON.stringify({ ts: Date.now(), tag, metrics, domCounters }),
+        });
+        // return JSHeapUsedSize in MB for the live-hold abort check
+        const used = Array.isArray(metrics)
+          ? metrics.find((m) => m.name === 'JSHeapUsedSize')?.value
+          : undefined;
+        return used ? Math.round(used / 1048576) : null;
       });
-      // return JSHeapUsedSize in MB for the live-hold abort check
-      const used = Array.isArray(metrics)
-        ? metrics.find((m) => m.name === 'JSHeapUsedSize')?.value
-        : undefined;
-      return used ? Math.round(used / 1048576) : null;
     }),
   );
 
@@ -126,6 +150,23 @@ const heapSnapshot = (tag) =>
           ts: Date.now(),
           res,
         }),
+      }),
+    );
+
+// Pull a native (Blink C++) memory-infra dump over the Node-side CDP WebSocket
+// (plugins/memory-dump.js). The V8 heap snapshot names detached DOM but cannot weigh its
+// native cost; this dump gives the per-allocator breakdown (malloc/partition_alloc/blink_gc
+// /v8) that proves the RSS ratchet is Blink native memory. taskTimeout is 10s globally, so
+// override it. Best-effort: the task never throws; the {ok,...} outcome is logged to
+// live-hold.jsonl for correlation. Issued AFTER the heap snapshot on the same tick so the
+// two CDP captures never overlap on one target.
+const memoryDump = (tag) =>
+  cy
+    .task('probeMemoryDump', { name: `mem-${tag}` }, { timeout: 60000 })
+    .then((res) =>
+      cy.task('probeAppend', {
+        file: 'live-hold.jsonl',
+        line: JSON.stringify({ tag: `memdump-${tag}`, ts: Date.now(), res }),
       }),
     );
 
@@ -254,6 +295,7 @@ const editCycle = (i) => {
       snapshotInPage(`amp-${i}`);
       if (AMP_SNAPSHOT_AT.includes(i)) {
         heapSnapshot(`amp-${i}`);
+        memoryDump(`amp-${i}`);
       }
       if (i > 0 && i % CHECKPOINT_EVERY === 0) {
         dumpCpuCheckpoint();
@@ -267,6 +309,7 @@ const editCycle = (i) => {
     // The authoritative captures are the in-amplifier ones above (this test often never
     // runs — the renderer usually crashes during the amplifier).
     heapSnapshot('holdstart');
+    memoryDump('holdstart');
 
     const holdStep = (n) => {
       if (n <= 0) return;
@@ -281,6 +324,7 @@ const editCycle = (i) => {
         // a second retainer snapshot mid-hold, once more DOM has ratcheted
         if (HOLD_SAMPLES - n === 40) {
           heapSnapshot('hold-mid');
+          memoryDump('hold-mid');
         }
         if (usedMB && usedMB >= HEAP_ABORT_MB) {
           cy.task('probeAppend', {
@@ -290,6 +334,7 @@ const editCycle = (i) => {
           dumpCpuCheckpoint();
           dumpHeapCheckpoint(false);
           heapSnapshot('heap-abort');
+          memoryDump('heap-abort');
           return; // stop holding; we've captured the ratchet near the cap
         }
         holdStep(n - 1);

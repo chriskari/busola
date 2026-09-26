@@ -27,6 +27,10 @@ on:
         description: 'Enable the edit-cluster OOM loop diagnostic probe (CDP profiling + in-page probe + Chrome memory sampler). Leave off for normal runs.'
         type: boolean
         default: false
+      disable_chart_animation:
+        description: 'A/B arm: disable recharts chart animation on the overview (sets CYPRESS_DISABLE_CHART_ANIMATION). Use with loop_probe=true to compare the RSS ratchet with animation ON vs OFF. Temporary campaign toggle.'
+        type: boolean
+        default: false
 
 concurrency:
   group: pull-integration-cluster-k3d-${{ github.workflow_ref }}-${{ github.event.pull_request.number || github.ref }}
@@ -89,6 +93,11 @@ jobs:
           # `|| github.head_ref == 'improve-ci'` clause before merging). Every other PR and
           # merge_group run leaves the probe off.
           LOOP_PROBE: ${{ (inputs.loop_probe || github.head_ref == 'improve-ci') && '1' || '' }}
+          # A/B arm selector for the recharts-animation OOM hypothesis (temporary campaign
+          # toggle — REMOVE with the rest of the loop-probe A/B scaffolding). When set, the
+          # probe spec plants window.__DISABLE_CHART_ANIMATION so the overview charts skip
+          # animation, isolating the animation loop as the RSS-ratchet driver.
+          DISABLE_CHART_ANIMATION: ${{ inputs.disable_chart_animation && '1' || '' }}
         run: |
           k3d kubeconfig get k3dCluster > tests/integration/fixtures/kubeconfig.yaml
           export CYPRESS_DOMAIN=http://localhost:3001
@@ -101,6 +110,10 @@ jobs:
             export CYPRESS_LOOP_PROBE=1
             bash ../../.github/scripts/sample-chrome-mem.sh cypress/loop-probe/chrome-mem.csv 1 &
             SAMPLER_PID=$!
+          fi
+          if [ -n "$DISABLE_CHART_ANIMATION" ]; then
+            echo "A/B arm: chart animation DISABLED (CYPRESS_DISABLE_CHART_ANIMATION=1)"
+            export CYPRESS_DISABLE_CHART_ANIMATION=1
           fi
           set +e
           npm run "test:cluster"

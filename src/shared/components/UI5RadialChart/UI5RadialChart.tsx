@@ -36,6 +36,15 @@ export const UI5RadialChart = ({
   const text = (percent > 10_000 ? percent.toPrecision(3) : percent) + '%';
   const textSize = size / Math.max(3.5, text.length) + 'px';
 
+  // A/B loop-probe scaffolding (temporary — removed once the recharts-animation OOM
+  // hypothesis is confirmed): the probe spec sets this flag via window:before:load so a
+  // single build can run animation-ON vs animation-OFF arms. The permanent fix threads a
+  // `noAnimation` prop through instead.
+  const noAnimation =
+    typeof window !== 'undefined' &&
+    (window as Window & { __DISABLE_CHART_ANIMATION?: boolean })
+      .__DISABLE_CHART_ANIMATION === true;
+
   const classnames = classNames(`radial-chart`, {
     'cursor-pointer': onClick,
   });
@@ -86,6 +95,7 @@ export const UI5RadialChart = ({
         {isChartReady && (
           <RadialChart
             displayValue={text}
+            noAnimation={noAnimation}
             displayValueStyle={{
               fontSize: textSize,
               fill: color,

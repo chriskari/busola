@@ -18,6 +18,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 const dir = process.argv[2] || '.';
 const read = (f) => {
@@ -76,13 +77,18 @@ if (mem) {
   const procs = [...byPid.values()];
   const labeledRenderers = procs.filter((p) => p.ptype === 'renderer');
   // hottest process overall (fallback when labeling failed)
-  const hot = procs.sort((a, b) => b.peakRss - a.peakRss)[0] || { peakRss: 0, pegged: 0 };
+  const hot = procs.sort((a, b) => b.peakRss - a.peakRss)[0] || {
+    peakRss: 0,
+    pegged: 0,
+  };
   // prefer a labeled renderer if one actually exists, else the hottest process
   const subject =
     labeledRenderers.sort((a, b) => b.peakRss - a.peakRss)[0] || hot;
 
   console.log('== OS memory sampler ==');
-  console.log(`  chrome processes seen: ${procs.length} (labeled renderer: ${labeledRenderers.length})`);
+  console.log(
+    `  chrome processes seen: ${procs.length} (labeled renderer: ${labeledRenderers.length})`,
+  );
   console.log(
     `  hottest process: pid ${subject.pid} type=${subject.ptype} ` +
       `peak RSS ${subject.peakRss} MB (cpu ${subject.peakCpu} at peak), ` +
@@ -108,12 +114,132 @@ if (cdp.length) {
   const first = cdp[0];
   const last = cdp[cdp.length - 1];
   console.log('== CDP Performance.getMetrics ==');
-  for (const name of ['JSHeapUsedSize', 'Nodes', 'JSEventListeners', 'LayoutCount']) {
+  for (const name of [
+    'JSHeapUsedSize',
+    'Nodes',
+    'JSEventListeners',
+    'LayoutCount',
+    'LayoutObjects',
+  ]) {
     const a = val(first, name);
     const b = val(last, name);
     if (a != null && b != null) {
-      const fmt = name === 'JSHeapUsedSize' ? (v) => `${Math.round(v / 1048576)}MB` : (v) => v;
+      const fmt =
+        name === 'JSHeapUsedSize'
+          ? (v) => `${Math.round(v / 1048576)}MB`
+          : (v) => v;
       console.log(`  ${name}: ${fmt(a)} -> ${fmt(b)}`);
+    }
+  }
+  // Memory.getDOMCounters live-node series (folded into cdp-metrics as `domCounters`).
+  // Tracking against LayoutObjects reconfirms LIVE attached-tree growth (LayoutObjects
+  // exist only for attached/rendered nodes) rather than detached-document retention.
+  const domFirst = cdp.find((m) => m.domCounters?.nodes != null)?.domCounters;
+  const domLast = [...cdp]
+    .reverse()
+    .find((m) => m.domCounters?.nodes != null)?.domCounters;
+  if (domFirst && domLast) {
+    console.log(
+      `  domCounters.nodes: ${domFirst.nodes} -> ${domLast.nodes} ` +
+        `(documents ${domFirst.documents} -> ${domLast.documents}, ` +
+        `listeners ${domFirst.jsEventListeners} -> ${domLast.jsEventListeners})`,
+    );
+    const layoutLast = val(last, 'LayoutObjects');
+    if (
+      domLast.documents != null &&
+      domLast.documents <= 20 &&
+      layoutLast > domLast.nodes
+    )
+      console.log(
+        `  => LIVE attached-DOM growth: documents flat (${domLast.documents}) while ` +
+          `nodes + LayoutObjects climb together`,
+      );
+  }
+  console.log('');
+}
+
+// ---- native memory-infra dumps: which ALLOCATOR holds the RSS --------------------
+// The V8 heap snapshot names detached DOM but cannot weigh its native (Blink C++) cost.
+// The memory-infra dumps (plugins/memory-dump.js) give the per-allocator breakdown so we
+// can show the ratchet lives in Blink native allocators (attached layout tree +
+// partition_alloc/malloc), not the V8 heap. Each dump trace event is one process; we pick
+// the process with the largest resident_set_bytes (the AUT renderer), matching the
+// chrome-mem.csv heuristic.
+const memFiles = fs
+  .readdirSync(dir)
+  .filter((f) => f.endsWith('.memtrace.jsonl.gz'))
+  .map((f) => ({ f, mtime: fs.statSync(path.join(dir, f)).mtimeMs }))
+  .sort((a, b) => a.mtime - b.mtime) // capture order
+  .map((x) => x.f);
+
+if (memFiles.length) {
+  // memory-infra encodes sizes as hex strings (no 0x prefix), e.g. "9c40000".
+  const hex = (v) => (v == null ? 0 : parseInt(String(v), 16) || 0);
+  const MB = (bytes) => Math.round(bytes / 1048576);
+  const ALLOCATORS = ['malloc', 'partition_alloc', 'blink_gc', 'v8'];
+
+  const parseDump = (file) => {
+    let text;
+    try {
+      text = zlib
+        .gunzipSync(fs.readFileSync(path.join(dir, file)))
+        .toString('utf8');
+    } catch (e) {
+      return { file, error: String(e) };
+    }
+    // Each memory-dump trace event carries args.dumps for ONE process; keep the hottest.
+    let best = null;
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      let e;
+      try {
+        e = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const dumps = e.args?.dumps;
+      if (!dumps?.process_totals) continue;
+      const rss = hex(dumps.process_totals.resident_set_bytes);
+      if (!best || rss > best.rss) best = { rss, dumps, pid: e.pid };
+    }
+    if (!best) return { file, error: 'no memory-dump events' };
+    const row = { file, rssMB: MB(best.rss), pid: best.pid };
+    for (const a of ALLOCATORS) {
+      const attrs = best.dumps.allocators?.[a]?.attrs;
+      row[a] = MB(hex(attrs?.size?.value ?? attrs?.effective_size?.value));
+    }
+    return row;
+  };
+
+  const rows = memFiles.map(parseDump).filter((r) => !r.error);
+  console.log('== native memory-infra (hottest process, MB per allocator) ==');
+  if (!rows.length) {
+    console.log('  (no parseable dumps)');
+  } else {
+    const tag = (f) => f.replace(/^mem-|\.memtrace\.jsonl\.gz$/g, '');
+    console.log(
+      `  ${'tag'.padEnd(12)} ${'rss'.padStart(6)} ${ALLOCATORS.map((a) => a.padStart(9)).join(' ')}`,
+    );
+    for (const r of rows) {
+      console.log(
+        `  ${tag(r.file).padEnd(12)} ${String(r.rssMB).padStart(6)} ` +
+          ALLOCATORS.map((a) => String(r[a]).padStart(9)).join(' '),
+      );
+    }
+    if (rows.length >= 2) {
+      const a = rows[0];
+      const b = rows[rows.length - 1];
+      const d = (k) => b[k] - a[k];
+      const blinkNative = d('malloc') + d('partition_alloc') + d('blink_gc');
+      console.log(
+        `  delta ${tag(a.file)}->${tag(b.file)}: rss +${d('rssMB')}MB  ` +
+          ALLOCATORS.map((k) => `${k} +${d(k)}`).join('  '),
+      );
+      if (blinkNative > d('v8') && blinkNative > 100)
+        console.log(
+          `  => NATIVE RATCHET: Blink native (malloc+partition_alloc+blink_gc) +${blinkNative}MB ` +
+            `dominates v8 +${d('v8')}MB`,
+        );
     }
   }
   console.log('');
@@ -161,10 +287,13 @@ if (snaps.length) {
       console.log(`  window ${w.id}: peak ${w.peakTotal} nodes  ${w.url}`);
     }
     const top = wins[0].snap.domGrowth;
-    console.log(`\n  >> crash-suspect window ${wins[0].id} (${wins[0].peakTotal} nodes) <<`);
+    console.log(
+      `\n  >> crash-suspect window ${wins[0].id} (${wins[0].peakTotal} nodes) <<`,
+    );
     if (top?.topTags?.length) {
       console.log('  proliferating tags:');
-      for (const { k, v } of top.topTags.slice(0, 12)) console.log(`    ${String(v).padStart(6)}  ${k}`);
+      for (const { k, v } of top.topTags.slice(0, 12))
+        console.log(`    ${String(v).padStart(6)}  ${k}`);
     }
     if (top?.topContainers?.length) {
       console.log('  largest containers (childElementCount  selector):');
@@ -185,7 +314,9 @@ if (profiles.length) {
   console.log(
     '\n  Open .cpuprofile in Chrome DevTools (Performance > load) or https://speedscope.app',
   );
-  console.log('  to see the dominant function; .heapprofile in DevTools > Memory.');
+  console.log(
+    '  to see the dominant function; .heapprofile in DevTools > Memory.',
+  );
 } else {
   console.log('  (none — the loop likely did not reproduce in this run)');
 }
